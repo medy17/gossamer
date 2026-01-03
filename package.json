@@ -1,0 +1,46 @@
+{
+  "name": "@dropsilk/gossamer",
+  "version": "0.5.1",
+  "description": "Narrative telemetry: structured events + config-driven stories",
+  "license": "MIT",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "jiti": "^2.5.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.5.0",
+    "typescript": "^5.7.2"
+  },
+  "keywords": [
+    "logging",
+    "telemetry",
+    "tracing",
+    "logger",
+    "observability"
+  ],
+  "author": "Ahmed medy17"
+}
