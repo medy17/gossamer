@@ -25,6 +25,8 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
+    "test": "vitest",
+    "test:run": "vitest run",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -33,7 +35,8 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "tsup": "^8.5.0",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.0.16"
   },
   "keywords": [
     "logging",
