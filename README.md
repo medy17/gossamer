@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="readme-assets/logo.svg" width="120" alt="Gossamer Logo" />
+  <img src="https://raw.githubusercontent.com/medy17/gossamer/6b4e5dcd58df77a12be0adc23b01b90315de3421/readme-assets/logo.svg" width="120" alt="Gossamer Logo" />
   <h1>Gossamer</h1>
   <p><strong>Narrative Telemetry: Structured events + Config-driven stories.</strong></p>
 </div>
