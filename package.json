@@ -19,6 +19,7 @@
     }
   },
   "files": [
+    "readme-assets",
     "dist"
   ],
   "sideEffects": false,
