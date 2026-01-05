@@ -1,80 +1,131 @@
-# @dropsilk/gossamer
+<div align="center">
+  <img src="readme-assets/logo.svg" width="120" alt="Gossamer Logo" />
+  <h1>Gossamer</h1>
+  <p><strong>Narrative Telemetry: Structured events + Config-driven stories.</strong></p>
+</div>
 
-Gossamer is config-driven narrative telemetry: emit structured events, optionally
-compile them into "stories" (correlated timelines) automatically.
 
-## Install
+Gossamer is a telemetry library designed to track "stories". Stories are cohesive narratives formed by a sequence of events. Unlike traditional logging which just dumps isolated events, Gossamer allows you to define the structure of a user journey (a "Story") and automatically tracks, correlates, and summarizes the events that make up that journey.
+
+## Features
+
+- **Story-based Tracking**: Define stories with a start trigger, tracking rules, and an end condition.
+- **structured Events**: Everything is a structured event with payloads.
+- **Config-Driven**: Define your tracking logic in a config file, not scattered throughout your code.
+- **Pluggable Transports**: Send data to console, files, HTTP endpoints, or build your own.
+- **Smart Sampling**: Sample noisy logs while ensuring critical stories are always fully captured.
+- **Crash Handling**: Built-in optional crash reporting.
+
+## Installation
 
 ```bash
 npm install @dropsilk/gossamer
+# or
+pnpm add @dropsilk/gossamer
 ```
 
-## Quick start (recommended: gossamer.config.js with types)
+## Quick Start
 
-Create `gossamer.config.js` at your project root:
+### 1. Create a Config
 
-```js
-/** @type {import("@dropsilk/gossamer").GossamerUserConfig} */
-module.exports = {
-  enabled: true,
-  verbosity: 1,
+Create a `gossamer.config.ts` (or `.js`, `.mjs`) in your project root:
 
-  levels: {
-    INFO: { colour: "cyan", icon: "i", active: true, minVerbosity: 0 },
-    WARN: { colour: "yellow", icon: "!", active: true, minVerbosity: 0 },
-    ERROR: { colour: "red", icon: "x", active: true, minVerbosity: 0 },
-    NOISY: { colour: "grey", icon: ".", active: true, minVerbosity: 2 }
-  },
+```typescript
+import type { GossamerUserConfig } from "@dropsilk/gossamer";
 
-  events: {
-    "system:startup": { level: "INFO" },
-    "system:heartbeat": { level: "NOISY" },
-    "flight:created": { level: "INFO" },
-    "flight:joined": { level: "INFO" },
-    "flight:signal": { level: "NOISY" },
-    "flight:ended": { level: "INFO" }
-  },
+const config: GossamerUserConfig = {
+    enabled: true,
+    verbosity: 0,
+    
+    // Define log levels
+    levels: {
+        INFO: { active: true, label: "INFO", colour: "green" },
+        ERROR: { active: true, label: "ERROR", colour: "red" },
+    },
 
-  stories: {
-    flight_story: {
-      enabled: true,
-      correlationKey: "flightCode",
-      trigger: "flight:created",
-      ender: "flight:ended",
-      maxAgeMs: 2 * 60 * 60 * 1000,
-      orphanStrategy: "ignore",
-      track: {
-        "flight:joined": { mode: "append", pick: ["joinerId", "joinerName"] },
-        "flight:signal": { mode: "count", counter: "signals" }
-      }
+    // Define known events
+    events: {
+        "user:login": { level: "INFO" },
+        "user:logout": { level: "INFO" },
+        "order:create": { level: "INFO" },
+        "order:complete": { level: "INFO" },
+    },
+
+    // Define Stories
+    stories: {
+        "UserSession": {
+            enabled: true,
+            correlationKey: "userId", // How to link events to this story
+            trigger: "user:login",    // Event that starts the story
+            ender: "user:logout",     // Event that ends the story
+            track: {
+                // Events to track within this story
+                "order:create": { mode: "append" },
+                "order:complete": { mode: "append" },
+            }
+        }
     }
-  }
 };
+
+export default config;
 ```
 
-In your app entry point:
+### 2. Initialize and Use
 
-```js
-const { gossamer } = require("@dropsilk/gossamer");
+```typescript
+import { gossamer } from "@dropsilk/gossamer";
 
 async function main() {
-  await gossamer.initFromFile();
-  gossamer.emit("system:startup", { port: 8080 });
+    // Initialize (loads gossamer.config.ts automatically)
+    await gossamer.initFromFile();
 
-  // Later, anywhere:
-  gossamer.emit("flight:created", { flightCode: "ABC123", creatorId: "u1" });
+    // Emit events
+    gossamer.emit("user:login", { userId: "123", name: "Alice" });
+
+    gossamer.emit("order:create", { userId: "123", orderId: "A-1" });
+    
+    // This event is tracked as part of the "UserSession" story for user 123
+    
+    gossamer.emit("user:logout", { userId: "123" });
+    // Story "UserSession" for user 123 is now complete and flushed to transports
 }
 
 main();
 ```
 
-## API
+## Core Concepts
 
-- `await gossamer.init(config, options?)`
-- `await gossamer.initFromFile({ path? })`
-- `gossamer.emit(eventName, payload?, emitOptions?)`
+### Events
+Basic unit of information. Emitted with a name and a payload.
+```typescript
+gossamer.emit("event:name", { key: "value" });
+```
 
-## Notes
+### Stories
+A `Story` represents a lifecycle. It:
+- Starts when a **trigger** event is observed.
+- Uses a **correlationKey** (e.g., `requestId`, `userId`) to bind subsequent events to the story instance.
+- **Tracks** specified events via rules (`append`, `count`, `ignore`).
+- Ends when an **ender** event is observed or it times out.
+- Is **Flushed** to transports as a single, cohesive `Trace` object containing the full timeline.
 
-- If you insist on `gossamer.config.ts`, it works because Gossamer loads it via
-  `jiti`. Still, `gossamer.config.js` is simpler and less fussy in production.
+### Context
+Global context that attaches to every emitted event (useful for request IDs, environment info, etc.).
+```typescript
+gossamer.setContext({ environment: "production" });
+
+// 'environment: production' is now in every event payload
+gossamer.emit("something", {}); 
+```
+
+### Transports
+Where your data goes. Defaults to a pretty console output.
+Available built-ins:
+- `ConsolePrettyTransport`
+- `JsonStdoutTransport`
+- `FileTransport`
+- `HttpTransport`
+
+## Configuration Reference
+
+See `src/core/types.ts` for full type definitions of `GossamerUserConfig`.
