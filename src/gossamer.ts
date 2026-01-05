@@ -51,6 +51,10 @@ class Gossamer {
             }
         });
 
+        if (options.captureCrashes) {
+            this.registerCrashHandlers();
+        }
+
         this.initialised = true;
 
         if (this.queue.length) {
@@ -60,6 +64,58 @@ class Gossamer {
                 this.emit(q.eventName, q.payload, q.options);
             }
         }
+    }
+
+    /**
+     * Flush all transports. Returns a promise that resolves when all transports have flushed.
+     * Useful for graceful shutdown.
+     */
+    public async flush(): Promise<void> {
+        await Promise.all(
+            this.transports.map((t) => {
+                if (t.flush) {
+                    return t.flush().catch(() => {
+                        // Ignore flush errors
+                    });
+                }
+                return Promise.resolve();
+            })
+        );
+    }
+
+    private registerCrashHandlers(): void {
+        const handler = (type: string, error: unknown) => {
+            // 1. Log the crash event
+            console.error(`[Gossamer] Process crashed via ${type}`, error);
+
+            this.emitError("crash:event", error, {
+                crash_type: type,
+                fatal: true,
+            });
+
+            // 2. Attempt to flush transports
+            this.flush()
+                .then(() => {
+                    console.error("[Gossamer] Flush completed");
+                })
+                .catch((e) => {
+                    console.error("[Gossamer] Flush failed", e);
+                })
+                .finally(() => {
+                    // Force exit for signals, otherwise node exits naturally for exceptions
+                    if (type === "SIGTERM" || type === "SIGINT") {
+                        process.exit(1);
+                    }
+                });
+        };
+
+        process.on("uncaughtException", (err) => handler("uncaughtException", err));
+        process.on("unhandledRejection", (reason) => handler("unhandledRejection", reason));
+
+        // Listen to signals
+        // Note: Registering these prevents default exit behavior, so we must manually exit
+        process.on("SIGTERM", () => handler("SIGTERM", new Error("SIGTERM received")));
+        process.on("SIGINT", () => handler("SIGINT", new Error("SIGINT received")));
     }
 
     public async initFromFile(

@@ -99,6 +99,11 @@ export type TransportStoryEntry = {
 export type Transport = {
     log(entry: TransportLogEntry): void;
     story(entry: TransportStoryEntry): void;
+    /**
+     * Optional method to flush any buffered data.
+     * Guaranteed to be called during graceful shutdown or manual flush.
+     */
+    flush?(): Promise<void>;
 };
 
 export type EmitOptions = {
@@ -143,6 +148,20 @@ export type GossamerInitOptions = {
      * Note: Stories are NOT affected by sampling - they always emit.
      */
     samplingStrategy?: SamplingStrategy;
+    /**
+     * If true, Gossamer will register global crash handlers for:
+     * - uncaughtException
+     * - unhandledRejection
+     * - SIGTERM
+     * - SIGINT
+     * 
+     * When a crash occurs, Gossamer will attempt to:
+     * 1. Log a final "crash:event" with error details
+     * 2. Flush all transports
+     * 
+     * Default: false
+     */
+    captureCrashes?: boolean;
 };
 
 export type GossamerResolvedConfig = {

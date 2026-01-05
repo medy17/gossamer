@@ -54,6 +54,21 @@ export class FileTransport implements Transport {
     }
 
     /**
+     * Flush buffered logs to disk.
+     */
+    public flush(): Promise<void> {
+        if (!this.stream) return Promise.resolve();
+
+        return new Promise((resolve) => {
+            if (this.stream?.write("")) {
+                resolve();
+            } else {
+                this.stream?.once("drain", resolve);
+            }
+        });
+    }
+
+    /**
      * Close the file stream. Call this during graceful shutdown.
      */
     public close(): Promise<void> {
