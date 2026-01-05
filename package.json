@@ -1,6 +1,6 @@
 {
   "name": "@dropsilk/gossamer",
-  "version": "0.5.1",
+  "version": "0.7.0",
   "description": "Narrative telemetry: structured events + config-driven stories",
   "license": "MIT",
   "private": false,
