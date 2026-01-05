@@ -56,8 +56,15 @@ export class ConsolePrettyTransport implements Transport {
         const lvl = colourise(levelColour, level.padEnd(5));
         const ev = colourise("magenta", entry.event);
 
+        // Build ID suffix if any IDs present
+        const ids: string[] = [];
+        if (entry.request_id) ids.push(`req:${entry.request_id}`);
+        if (entry.trace_id) ids.push(`trace:${entry.trace_id}`);
+        if (entry.span_id) ids.push(`span:${entry.span_id}`);
+        const idSuffix = ids.length ? colourise("grey", ` [${ids.join(" ")}]`) : "";
+
         // eslint-disable-next-line no-console
-        console.log(`${ts} ${lvl} ${ev} ${entry.message}`);
+        console.log(`${ts} ${lvl} ${ev} ${entry.message}${idSuffix}`);
 
         if (entry.payload && Object.keys(entry.payload).length) {
             // eslint-disable-next-line no-console

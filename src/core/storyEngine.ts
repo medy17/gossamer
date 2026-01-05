@@ -191,6 +191,27 @@ export class StoryEngine {
         status: "complete" | "stale" | "ended",
     ): void {
         const now = Date.now();
+
+        // Compute summary fields
+        const timeline = story.timeline;
+        const event_count = timeline.length;
+        const first_event = timeline.length > 0 ? timeline[0].event : undefined;
+        const last_event = timeline.length > 0 ? timeline[timeline.length - 1].event : undefined;
+
+        // Check for errors (look for ERROR level events or error in payload)
+        const has_error = timeline.some(item => {
+            // Check if event name contains "error" or "fail"
+            const eventNameLower = item.event.toLowerCase();
+            if (eventNameLower.includes("error") || eventNameLower.includes("fail")) {
+                return true;
+            }
+            // Check if payload contains an error field
+            if (item.payload && "error" in item.payload) {
+                return true;
+            }
+            return false;
+        });
+
         const entry: TransportStoryEntry = {
             timestamp: new Date().toISOString(),
             storyName: story.storyName,
@@ -200,6 +221,11 @@ export class StoryEngine {
             durationMs: Math.max(0, now - story.startTimeMs),
             counters: story.counters,
             timeline: story.timeline,
+            // Summary fields
+            event_count,
+            first_event,
+            last_event,
+            has_error,
         };
 
         this.onFlush(entry);

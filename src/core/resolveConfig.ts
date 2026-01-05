@@ -162,12 +162,34 @@ export function resolveConfig(
                 ? redactKeys(input.payload, input.redact)
                 : input.payload;
 
+        // Extract first-class ID fields from payload
+        const { request_id, trace_id, span_id, ...restPayload } = safePayload as {
+            request_id?: unknown;
+            trace_id?: unknown;
+            span_id?: unknown;
+            [key: string]: unknown;
+        };
+
+        // Helper to safely extract string IDs
+        const extractId = (value: unknown): string | undefined => {
+            if (typeof value === "string" && value.trim().length > 0) return value;
+            if (typeof value === "number" && Number.isFinite(value)) return String(value);
+            return undefined;
+        };
+
+        // Generate unique event ID
+        const event_id = `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
         return {
             timestamp: new Date().toISOString(),
+            event_id,
             level: input.level,
             event: input.eventName,
             message,
-            payload: entryVerbosity >= 0 ? safePayload : undefined,
+            request_id: extractId(request_id),
+            trace_id: extractId(trace_id),
+            span_id: extractId(span_id),
+            payload: entryVerbosity >= 0 ? restPayload : undefined,
         };
     };
 

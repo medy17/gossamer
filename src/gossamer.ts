@@ -5,6 +5,8 @@ import type {
     GossamerInitOptions,
     GossamerResolvedConfig,
     GossamerUserConfig,
+    SamplingStrategy,
+    Timer,
     Transport,
 } from "./core/types";
 import { StoryEngine } from "./core/storyEngine";
@@ -22,6 +24,8 @@ class Gossamer {
     private transports: Transport[] = [];
     private storyEngine: StoryEngine | null = null;
     private queue: QueuedEvent[] = [];
+    private context: Record<string, unknown> = {};
+    private samplingStrategy: SamplingStrategy | null = null;
 
     public async init(
         userConfig: GossamerUserConfig,
@@ -33,6 +37,7 @@ class Gossamer {
         this.transports = options.transports?.length
             ? options.transports
             : [new ConsolePrettyTransport({ pretty: true })];
+        this.samplingStrategy = options.samplingStrategy ?? null;
 
         this.storyEngine?.stop();
         this.storyEngine = new StoryEngine(resolved, (storyEntry) => {
@@ -70,8 +75,11 @@ class Gossamer {
         payload: Record<string, unknown> = {},
         options?: EmitOptions,
     ): void {
+        // Merge ambient context with payload (payload values take precedence)
+        const mergedPayload = { ...this.context, ...payload };
+
         if (!this.initialised || !this.config) {
-            this.queue.push({ eventName, payload, options });
+            this.queue.push({ eventName, payload: mergedPayload, options });
             return;
         }
 
@@ -81,7 +89,7 @@ class Gossamer {
         // --- LOGIC CHANGE IS HERE ---
         // First, always let the story engine see the event, because it
         // might want to track it even if it's too noisy to log.
-        this.storyEngine?.process(eventName, payload);
+        this.storyEngine?.process(eventName, mergedPayload);
         // ----------------------------
 
         const eventDef = cfg.events[eventName];
@@ -93,10 +101,15 @@ class Gossamer {
             const fallbackLevel = cfg.unknownEvents.level;
             const entry = cfg.formatLogEntry({
                 eventName,
-                payload,
+                payload: mergedPayload,
                 level: fallbackLevel,
                 message: options?.message,
             });
+
+            // Apply sampling strategy if configured
+            if (this.samplingStrategy && !this.samplingStrategy(entry)) {
+                return; // Sampled out
+            }
 
             for (const t of this.transports) {
                 try {
@@ -123,11 +136,16 @@ class Gossamer {
 
         const entry = cfg.formatLogEntry({
             eventName,
-            payload,
+            payload: mergedPayload,
             level: eventDef.level,
             message: options?.message ?? eventDef.message,
             redact: eventDef.redact,
         });
+
+        // Apply sampling strategy if configured
+        if (this.samplingStrategy && !this.samplingStrategy(entry)) {
+            return; // Sampled out
+        }
 
         for (const t of this.transports) {
             try {
@@ -144,6 +162,173 @@ class Gossamer {
 
     public isInitialised(): boolean {
         return this.initialised;
+    }
+
+    /**
+     * Set ambient context that will be merged into all emitted events.
+     * Merges with existing context (does not replace).
+     */
+    public setContext(ctx: Record<string, unknown>): void {
+        this.context = { ...this.context, ...ctx };
+    }
+
+    /**
+     * Clear all ambient context.
+     */
+    public clearContext(): void {
+        this.context = {};
+    }
+
+    /**
+     * Get a copy of the current ambient context.
+     */
+    public getContext(): Record<string, unknown> {
+        return { ...this.context };
+    }
+
+    /**
+     * Execute a function with temporary additional context.
+     * The temporary context is merged on top of existing context for the duration.
+     * After the function completes (or throws), context is restored.
+     */
+    public withContext<T>(
+        tempContext: Record<string, unknown>,
+        fn: () => T,
+    ): T {
+        const previousContext = { ...this.context };
+        this.context = { ...this.context, ...tempContext };
+
+        try {
+            return fn();
+        } finally {
+            this.context = previousContext;
+        }
+    }
+
+    /**
+     * Async version of withContext for async functions.
+     */
+    public async withContextAsync<T>(
+        tempContext: Record<string, unknown>,
+        fn: () => Promise<T>,
+    ): Promise<T> {
+        const previousContext = { ...this.context };
+        this.context = { ...this.context, ...tempContext };
+
+        try {
+            return await fn();
+        } finally {
+            this.context = previousContext;
+        }
+    }
+
+    /**
+     * Set a sampling strategy at runtime.
+     * Pass null to disable sampling (keep all events).
+     */
+    public setSamplingStrategy(strategy: SamplingStrategy | null): void {
+        this.samplingStrategy = strategy;
+    }
+
+    /**
+     * Start a timer for measuring event duration.
+     * Call timer.end() to emit the event with duration_ms automatically calculated.
+     * 
+     * @example
+     * const timer = gossamer.startTimer("db:query");
+     * await runQuery();
+     * timer.end({ rows: 42 }); // Emits with duration_ms
+     */
+    public startTimer(
+        eventName: string,
+        initialPayload: Record<string, unknown> = {},
+    ): Timer {
+        const startTime = Date.now();
+        return {
+            end: (additionalPayload: Record<string, unknown> = {}, options?: EmitOptions) => {
+                const duration_ms = Date.now() - startTime;
+                this.emit(eventName, {
+                    ...initialPayload,
+                    ...additionalPayload,
+                    duration_ms,
+                }, options);
+            },
+            /**
+             * Cancel the timer without emitting an event.
+             */
+            cancel: () => {
+                // No-op, but provides explicit API for discarding a timer
+            },
+        };
+    }
+
+    /**
+     * Emit an error event with standardized error payload.
+     * Automatically extracts name, message, code, and stack from the error.
+     * 
+     * @example
+     * try { ... } catch (err) {
+     *   gossamer.emitError("order:failed", err, { order_id: "123" });
+     * }
+     */
+    public emitError(
+        eventName: string,
+        error: unknown,
+        additionalPayload: Record<string, unknown> = {},
+        options?: EmitOptions,
+    ): void {
+        const errorPayload = this.normalizeError(error);
+        this.emit(eventName, {
+            ...additionalPayload,
+            error: errorPayload,
+        }, options);
+    }
+
+    /**
+     * Normalize an error into a standardized payload object.
+     */
+    private normalizeError(error: unknown): Record<string, unknown> {
+        if (error instanceof Error) {
+            const normalized: Record<string, unknown> = {
+                name: error.name,
+                message: error.message,
+            };
+
+            // Extract common error properties
+            if ("code" in error && error.code !== undefined) {
+                normalized.code = error.code;
+            }
+            if ("statusCode" in error && error.statusCode !== undefined) {
+                normalized.statusCode = error.statusCode;
+            }
+            if ("status" in error && error.status !== undefined) {
+                normalized.status = error.status;
+            }
+
+            // Include stack in development, omit in production by default
+            // Users can override via redact config if needed
+            if (error.stack) {
+                normalized.stack = error.stack;
+            }
+
+            // Extract cause if present (ES2022+)
+            if ("cause" in error && error.cause !== undefined) {
+                normalized.cause = this.normalizeError(error.cause);
+            }
+
+            return normalized;
+        }
+
+        // Handle non-Error objects
+        if (typeof error === "string") {
+            return { message: error };
+        }
+
+        if (typeof error === "object" && error !== null) {
+            return { raw: error };
+        }
+
+        return { message: String(error) };
     }
 }
 

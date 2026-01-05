@@ -184,12 +184,23 @@ function resolveConfig(user) {
     const minVerbosity = levelDef?.minVerbosity ?? 0;
     const entryVerbosity = Math.max(minVerbosity, 0);
     const safePayload = input.redact && input.redact.length ? redactKeys(input.payload, input.redact) : input.payload;
+    const { request_id, trace_id, span_id, ...restPayload } = safePayload;
+    const extractId = (value) => {
+      if (typeof value === "string" && value.trim().length > 0) return value;
+      if (typeof value === "number" && Number.isFinite(value)) return String(value);
+      return void 0;
+    };
+    const event_id = `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     return {
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      event_id,
       level: input.level,
       event: input.eventName,
       message,
-      payload: entryVerbosity >= 0 ? safePayload : void 0
+      request_id: extractId(request_id),
+      trace_id: extractId(trace_id),
+      span_id: extractId(span_id),
+      payload: entryVerbosity >= 0 ? restPayload : void 0
     };
   };
   return {
@@ -329,6 +340,20 @@ var StoryEngine = class {
   }
   flushStory(story, status) {
     const now = Date.now();
+    const timeline = story.timeline;
+    const event_count = timeline.length;
+    const first_event = timeline.length > 0 ? timeline[0].event : void 0;
+    const last_event = timeline.length > 0 ? timeline[timeline.length - 1].event : void 0;
+    const has_error = timeline.some((item) => {
+      const eventNameLower = item.event.toLowerCase();
+      if (eventNameLower.includes("error") || eventNameLower.includes("fail")) {
+        return true;
+      }
+      if (item.payload && "error" in item.payload) {
+        return true;
+      }
+      return false;
+    });
     const entry = {
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       storyName: story.storyName,
@@ -337,7 +362,12 @@ var StoryEngine = class {
       meta: story.meta,
       durationMs: Math.max(0, now - story.startTimeMs),
       counters: story.counters,
-      timeline: story.timeline
+      timeline: story.timeline,
+      // Summary fields
+      event_count,
+      first_event,
+      last_event,
+      has_error
     };
     this.onFlush(entry);
   }
@@ -390,7 +420,12 @@ var ConsolePrettyTransport = class {
     const ts = colourise("grey", entry.timestamp);
     const lvl = colourise(levelColour, level.padEnd(5));
     const ev = colourise("magenta", entry.event);
-    console.log(`${ts} ${lvl} ${ev} ${entry.message}`);
+    const ids = [];
+    if (entry.request_id) ids.push(`req:${entry.request_id}`);
+    if (entry.trace_id) ids.push(`trace:${entry.trace_id}`);
+    if (entry.span_id) ids.push(`span:${entry.span_id}`);
+    const idSuffix = ids.length ? colourise("grey", ` [${ids.join(" ")}]`) : "";
+    console.log(`${ts} ${lvl} ${ev} ${entry.message}${idSuffix}`);
     if (entry.payload && Object.keys(entry.payload).length) {
       console.log(colourise("grey", JSON.stringify(entry.payload, null, 2)));
     }
@@ -416,10 +451,13 @@ var Gossamer = class {
   transports = [];
   storyEngine = null;
   queue = [];
+  context = {};
+  samplingStrategy = null;
   async init(userConfig, options = {}) {
     const resolved = resolveConfig(userConfig);
     this.config = resolved;
     this.transports = options.transports?.length ? options.transports : [new ConsolePrettyTransport({ pretty: true })];
+    this.samplingStrategy = options.samplingStrategy ?? null;
     this.storyEngine?.stop();
     this.storyEngine = new StoryEngine(resolved, (storyEntry) => {
       for (const t of this.transports) {
@@ -443,23 +481,27 @@ var Gossamer = class {
     await this.init(userConfig, initOptions);
   }
   emit(eventName, payload = {}, options) {
+    const mergedPayload = { ...this.context, ...payload };
     if (!this.initialised || !this.config) {
-      this.queue.push({ eventName, payload, options });
+      this.queue.push({ eventName, payload: mergedPayload, options });
       return;
     }
     const cfg = this.config;
     if (!cfg.enabled) return;
-    this.storyEngine?.process(eventName, payload);
+    this.storyEngine?.process(eventName, mergedPayload);
     const eventDef = cfg.events[eventName];
     if (!eventDef) {
       if (!cfg.unknownEvents.enabled) return;
       const fallbackLevel = cfg.unknownEvents.level;
       const entry2 = cfg.formatLogEntry({
         eventName,
-        payload,
+        payload: mergedPayload,
         level: fallbackLevel,
         message: options?.message
       });
+      if (this.samplingStrategy && !this.samplingStrategy(entry2)) {
+        return;
+      }
       for (const t of this.transports) {
         try {
           t.log(entry2);
@@ -477,11 +519,14 @@ var Gossamer = class {
     }
     const entry = cfg.formatLogEntry({
       eventName,
-      payload,
+      payload: mergedPayload,
       level: eventDef.level,
       message: options?.message ?? eventDef.message,
       redact: eventDef.redact
     });
+    if (this.samplingStrategy && !this.samplingStrategy(entry)) {
+      return;
+    }
     for (const t of this.transports) {
       try {
         t.log(entry);
@@ -495,8 +540,261 @@ var Gossamer = class {
   isInitialised() {
     return this.initialised;
   }
+  /**
+   * Set ambient context that will be merged into all emitted events.
+   * Merges with existing context (does not replace).
+   */
+  setContext(ctx) {
+    this.context = { ...this.context, ...ctx };
+  }
+  /**
+   * Clear all ambient context.
+   */
+  clearContext() {
+    this.context = {};
+  }
+  /**
+   * Get a copy of the current ambient context.
+   */
+  getContext() {
+    return { ...this.context };
+  }
+  /**
+   * Execute a function with temporary additional context.
+   * The temporary context is merged on top of existing context for the duration.
+   * After the function completes (or throws), context is restored.
+   */
+  withContext(tempContext, fn) {
+    const previousContext = { ...this.context };
+    this.context = { ...this.context, ...tempContext };
+    try {
+      return fn();
+    } finally {
+      this.context = previousContext;
+    }
+  }
+  /**
+   * Async version of withContext for async functions.
+   */
+  async withContextAsync(tempContext, fn) {
+    const previousContext = { ...this.context };
+    this.context = { ...this.context, ...tempContext };
+    try {
+      return await fn();
+    } finally {
+      this.context = previousContext;
+    }
+  }
+  /**
+   * Set a sampling strategy at runtime.
+   * Pass null to disable sampling (keep all events).
+   */
+  setSamplingStrategy(strategy) {
+    this.samplingStrategy = strategy;
+  }
+  /**
+   * Start a timer for measuring event duration.
+   * Call timer.end() to emit the event with duration_ms automatically calculated.
+   * 
+   * @example
+   * const timer = gossamer.startTimer("db:query");
+   * await runQuery();
+   * timer.end({ rows: 42 }); // Emits with duration_ms
+   */
+  startTimer(eventName, initialPayload = {}) {
+    const startTime = Date.now();
+    return {
+      end: (additionalPayload = {}, options) => {
+        const duration_ms = Date.now() - startTime;
+        this.emit(eventName, {
+          ...initialPayload,
+          ...additionalPayload,
+          duration_ms
+        }, options);
+      },
+      /**
+       * Cancel the timer without emitting an event.
+       */
+      cancel: () => {
+      }
+    };
+  }
+  /**
+   * Emit an error event with standardized error payload.
+   * Automatically extracts name, message, code, and stack from the error.
+   * 
+   * @example
+   * try { ... } catch (err) {
+   *   gossamer.emitError("order:failed", err, { order_id: "123" });
+   * }
+   */
+  emitError(eventName, error, additionalPayload = {}, options) {
+    const errorPayload = this.normalizeError(error);
+    this.emit(eventName, {
+      ...additionalPayload,
+      error: errorPayload
+    }, options);
+  }
+  /**
+   * Normalize an error into a standardized payload object.
+   */
+  normalizeError(error) {
+    if (error instanceof Error) {
+      const normalized = {
+        name: error.name,
+        message: error.message
+      };
+      if ("code" in error && error.code !== void 0) {
+        normalized.code = error.code;
+      }
+      if ("statusCode" in error && error.statusCode !== void 0) {
+        normalized.statusCode = error.statusCode;
+      }
+      if ("status" in error && error.status !== void 0) {
+        normalized.status = error.status;
+      }
+      if (error.stack) {
+        normalized.stack = error.stack;
+      }
+      if ("cause" in error && error.cause !== void 0) {
+        normalized.cause = this.normalizeError(error.cause);
+      }
+      return normalized;
+    }
+    if (typeof error === "string") {
+      return { message: error };
+    }
+    if (typeof error === "object" && error !== null) {
+      return { raw: error };
+    }
+    return { message: String(error) };
+  }
 };
 var gossamer = new Gossamer();
+
+// src/transports/fileTransport.ts
+import fs2 from "fs";
+import path2 from "path";
+var FileTransport = class {
+  filePath;
+  stream = null;
+  constructor(options) {
+    this.filePath = path2.resolve(options.path);
+    const dir = path2.dirname(this.filePath);
+    if (!fs2.existsSync(dir)) {
+      fs2.mkdirSync(dir, { recursive: true });
+    }
+    const flags = options.append !== false ? "a" : "w";
+    this.stream = fs2.createWriteStream(this.filePath, { flags });
+  }
+  log(entry) {
+    if (!this.stream) return;
+    const line = JSON.stringify({ type: "event", ...entry }) + "\n";
+    this.stream.write(line);
+  }
+  story(entry) {
+    if (!this.stream) return;
+    const line = JSON.stringify({ type: "story", ...entry }) + "\n";
+    this.stream.write(line);
+  }
+  /**
+   * Close the file stream. Call this during graceful shutdown.
+   */
+  close() {
+    return new Promise((resolve, reject) => {
+      if (!this.stream) {
+        resolve();
+        return;
+      }
+      this.stream.end((err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+      this.stream = null;
+    });
+  }
+};
+
+// src/transports/httpTransport.ts
+var HttpTransport = class {
+  url;
+  batchSize;
+  flushIntervalMs;
+  headers;
+  timeoutMs;
+  batch = [];
+  flushTimer = null;
+  isFlushing = false;
+  constructor(options) {
+    this.url = options.url;
+    this.batchSize = options.batchSize ?? 100;
+    this.flushIntervalMs = options.flushIntervalMs ?? 5e3;
+    this.headers = {
+      "Content-Type": "application/json",
+      ...options.headers
+    };
+    this.timeoutMs = options.timeoutMs ?? 1e4;
+    this.startFlushTimer();
+  }
+  log(entry) {
+    this.batch.push({ type: "event", data: entry });
+    this.maybeFlush();
+  }
+  story(entry) {
+    this.batch.push({ type: "story", data: entry });
+    this.maybeFlush();
+  }
+  startFlushTimer() {
+    if (this.flushTimer) return;
+    this.flushTimer = setInterval(() => {
+      this.flush().catch(() => {
+      });
+    }, this.flushIntervalMs);
+  }
+  maybeFlush() {
+    if (this.batch.length >= this.batchSize) {
+      this.flush().catch(() => {
+      });
+    }
+  }
+  /**
+   * Flush the current batch to the server.
+   */
+  async flush() {
+    if (this.batch.length === 0 || this.isFlushing) return;
+    this.isFlushing = true;
+    const toSend = [...this.batch];
+    this.batch = [];
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+      await fetch(this.url, {
+        method: "POST",
+        headers: this.headers,
+        body: JSON.stringify(toSend),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+    } catch {
+      this.batch = [...toSend, ...this.batch];
+      if (this.batch.length > this.batchSize * 10) {
+        this.batch = this.batch.slice(-this.batchSize * 5);
+      }
+    } finally {
+      this.isFlushing = false;
+    }
+  }
+  /**
+   * Stop the transport and flush remaining events.
+   */
+  async close() {
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.flush();
+  }
+};
 
 // src/transports/jsonStdoutTransport.ts
 var JsonStdoutTransport = class {
@@ -507,9 +805,140 @@ var JsonStdoutTransport = class {
     console.log(JSON.stringify({ type: "story", ...entry }));
   }
 };
+
+// src/core/validateConfig.ts
+var KNOWN_STORY_FIELDS = [
+  "enabled",
+  "correlationKey",
+  "trigger",
+  "ender",
+  "track",
+  "maxAgeMs",
+  "orphanStrategy"
+];
+var KNOWN_EVENT_FIELDS = ["level", "active", "verbosity", "message", "redact"];
+var KNOWN_LEVEL_FIELDS = ["label", "colour", "icon", "active", "minVerbosity"];
+function findSimilar(input, candidates) {
+  const inputLower = input.toLowerCase();
+  for (const candidate of candidates) {
+    const candidateLower = candidate.toLowerCase();
+    if (inputLower === candidateLower && input !== candidate) {
+      return candidate;
+    }
+    if (Math.abs(input.length - candidate.length) <= 1) {
+      let diff = 0;
+      const shorter = input.length < candidate.length ? input : candidate;
+      const longer = input.length >= candidate.length ? input : candidate;
+      for (let i = 0; i < shorter.length; i++) {
+        if (shorter[i] !== longer[i]) diff++;
+      }
+      if (diff <= 1) {
+        return candidate;
+      }
+    }
+  }
+  return void 0;
+}
+function validateConfig(config) {
+  const errors = [];
+  if (config.stories) {
+    for (const [storyName, storyDef] of Object.entries(config.stories)) {
+      const story = storyDef;
+      const basePath = `stories.${storyName}`;
+      if (!story.correlationKey) {
+        errors.push({
+          path: basePath,
+          message: `Missing required field: "correlationKey"`
+        });
+      }
+      if (!story.trigger) {
+        errors.push({
+          path: basePath,
+          message: `Missing required field: "trigger"`
+        });
+      }
+      for (const key of Object.keys(story)) {
+        if (!KNOWN_STORY_FIELDS.includes(key)) {
+          const similar = findSimilar(key, KNOWN_STORY_FIELDS);
+          errors.push({
+            path: `${basePath}.${key}`,
+            message: `Unknown field: "${key}"`,
+            suggestion: similar ? `Did you mean "${similar}"?` : void 0
+          });
+        }
+      }
+      if (story.orphanStrategy && !["ignore", "start"].includes(story.orphanStrategy)) {
+        errors.push({
+          path: `${basePath}.orphanStrategy`,
+          message: `Invalid value "${story.orphanStrategy}". Must be "ignore" or "start".`
+        });
+      }
+    }
+  }
+  if (config.events) {
+    for (const [eventName, eventDef] of Object.entries(config.events)) {
+      const basePath = `events.${eventName}`;
+      if (!eventDef.level) {
+        errors.push({
+          path: basePath,
+          message: `Missing required field: "level"`
+        });
+      }
+      for (const key of Object.keys(eventDef)) {
+        if (!KNOWN_EVENT_FIELDS.includes(key)) {
+          const similar = findSimilar(key, KNOWN_EVENT_FIELDS);
+          errors.push({
+            path: `${basePath}.${key}`,
+            message: `Unknown field: "${key}"`,
+            suggestion: similar ? `Did you mean "${similar}"?` : void 0
+          });
+        }
+      }
+    }
+  }
+  if (config.levels) {
+    for (const [levelName, levelDef] of Object.entries(config.levels)) {
+      const basePath = `levels.${levelName}`;
+      for (const key of Object.keys(levelDef)) {
+        if (!KNOWN_LEVEL_FIELDS.includes(key)) {
+          const similar = findSimilar(key, KNOWN_LEVEL_FIELDS);
+          errors.push({
+            path: `${basePath}.${key}`,
+            message: `Unknown field: "${key}"`,
+            suggestion: similar ? `Did you mean "${similar}"?` : void 0
+          });
+        }
+      }
+    }
+  }
+  return {
+    valid: errors.length === 0,
+    errors
+  };
+}
+function assertValidConfig(config) {
+  const result = validateConfig(config);
+  if (!result.valid) {
+    const messages = result.errors.map((err) => {
+      let msg = `  - ${err.path}: ${err.message}`;
+      if (err.suggestion) {
+        msg += ` (${err.suggestion})`;
+      }
+      return msg;
+    });
+    throw new Error(
+      `Gossamer config validation failed:
+${messages.join("\n")}`
+    );
+  }
+}
 export {
   ConsolePrettyTransport,
+  FileTransport,
+  HttpTransport,
   JsonStdoutTransport,
-  gossamer
+  assertValidConfig,
+  gossamer,
+  validateConfig
 };
 //# sourceMappingURL=index.js.map

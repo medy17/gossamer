@@ -62,9 +62,13 @@ export type GossamerUserConfig = {
 
 export type TransportLogEntry = {
     timestamp: string;
+    event_id: string;
     level: string;
     event: string;
     message: string;
+    request_id?: string;
+    trace_id?: string;
+    span_id?: string;
     payload?: Record<string, unknown>;
 };
 
@@ -81,6 +85,15 @@ export type TransportStoryEntry = {
         event: string;
         payload?: Record<string, unknown>;
     }>;
+    // Summary fields for easier debugging
+    /** Number of events in the timeline */
+    event_count: number;
+    /** First event name in the timeline */
+    first_event?: string;
+    /** Last event name in the timeline */
+    last_event?: string;
+    /** Whether any event in the timeline had an error level */
+    has_error: boolean;
 };
 
 export type Transport = {
@@ -93,8 +106,43 @@ export type EmitOptions = {
     verbosityOverride?: number;
 };
 
+/**
+ * Timer object returned by gossamer.startTimer().
+ * Call end() to emit the event with calculated duration_ms.
+ */
+export type Timer = {
+    /**
+     * End the timer and emit the event with duration_ms calculated.
+     */
+    end: (additionalPayload?: Record<string, unknown>, options?: EmitOptions) => void;
+    /**
+     * Cancel the timer without emitting an event.
+     */
+    cancel: () => void;
+};
+
+/**
+ * Sampling strategy function. Receives a log entry and returns:
+ * - true: keep the event (send to transports)
+ * - false: drop the event (don't send to transports)
+ * 
+ * Common patterns:
+ * - Always keep errors: `entry.level === "ERROR"`
+ * - Always keep slow requests: `entry.payload?.duration_ms > 2000`
+ * - Random sample: `Math.random() < 0.05` (5% sample)
+ */
+export type SamplingStrategy = (entry: TransportLogEntry) => boolean;
+
 export type GossamerInitOptions = {
     transports?: Transport[];
+    /**
+     * Sampling strategy for log events. If provided, each event is passed
+     * to this function before being sent to transports. Return true to keep,
+     * false to drop. If not provided, all events are kept.
+     * 
+     * Note: Stories are NOT affected by sampling - they always emit.
+     */
+    samplingStrategy?: SamplingStrategy;
 };
 
 export type GossamerResolvedConfig = {
